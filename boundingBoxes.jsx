@@ -20,6 +20,9 @@
 (function () {
     // ─── Настройки ───────────────────────────────────────────────────────────
     var STROKE_WIDTH = 3;
+    var DASH_LENGTH = 6;      // длина штриха пунктира (px)
+    var DASH_GAP = 4;         // длина разрыва пунктира (px)
+    var CROSS_HALF_SIZE = 10; // половина длины луча креста '+' (px)
     var BOX_PREFIX = "BBox: ";
     var TRAJ_PREFIX = "Traj: ";
     var GROUP_PREFIX = "BBox Group";
@@ -378,19 +381,20 @@
     // ─── Bounding Box (живой, expression) ────────────────────────────────────
     function createBoundingBox(comp, info, color, uniqueSuffix) {
         var layerName = BOX_PREFIX + info.name + uniqueSuffix;
-        var setup = createOverlayShapeLayer(comp, layerName, info.label, color);
+        var setup = createBBoxShapeLayer(comp, layerName, info.label, color);
 
-        var expr = buildBBoxExpression(info.name, info.isNull);
-        setPathExpression(setup.path, expr);
+        var expressions = buildBBoxExpressions(info.name, info.isNull);
+        setPathExpression(setup.dashedPaths[0], expressions[0]);
+        setPathExpression(setup.dashedPaths[1], expressions[1]);
+        setPathExpression(setup.solidPaths[0], expressions[2]);
+        setPathExpression(setup.solidPaths[1], expressions[3]);
 
         applyLayerTiming(setup.layer, info);
 
         return setup.layer;
     }
 
-    function buildBBoxExpression(sourceLayerName, isNull) {
-        var safeName = escapeForExpression(sourceLayerName);
-
+    function bboxCornersSnippet(safeName, isNull) {
         if (isNull) {
             return [
                 'var L = thisComp.layer("' + safeName + '");',
@@ -400,23 +404,81 @@
                 "var tr = fromComp(L.toComp([ap[0] + h, ap[1] - h]));",
                 "var br = fromComp(L.toComp([ap[0] + h, ap[1] + h]));",
                 "var bl = fromComp(L.toComp([ap[0] - h, ap[1] + h]));",
-                "createPath([tl, tr, br, bl], [], [], true);"
-            ].join("\n");
+                "var ok = true;"
+            ];
         }
 
         return [
             'var L = thisComp.layer("' + safeName + '");',
             "var r = L.sourceRectAtTime(time, false);",
-            "if (r.width <= 0 || r.height <= 0) {",
+            "var ok = r.width > 0 && r.height > 0;",
+            "var tl = ok ? fromComp(L.toComp([r.left, r.top])) : [0, 0];",
+            "var tr = ok ? fromComp(L.toComp([r.left + r.width, r.top])) : [0, 0];",
+            "var br = ok ? fromComp(L.toComp([r.left + r.width, r.top + r.height])) : [0, 0];",
+            "var bl = ok ? fromComp(L.toComp([r.left, r.top + r.height])) : [0, 0];"
+        ];
+    }
+
+    function buildBBoxExpressions(sourceLayerName, isNull) {
+        var safeName = escapeForExpression(sourceLayerName);
+        var corners = bboxCornersSnippet(safeName, isNull);
+        var crossH = CROSS_HALF_SIZE;
+
+        var rectExpr = corners.concat([
+            "if (!ok) {",
             "    createPath([[0, 0]], [], [], false);",
             "} else {",
-            "    var tl = fromComp(L.toComp([r.left, r.top]));",
-            "    var tr = fromComp(L.toComp([r.left + r.width, r.top]));",
-            "    var br = fromComp(L.toComp([r.left + r.width, r.top + r.height]));",
-            "    var bl = fromComp(L.toComp([r.left, r.top + r.height]));",
             "    createPath([tl, tr, br, bl], [], [], true);",
             "}"
-        ].join("\n");
+        ]);
+
+        var triangleExpr = corners.concat([
+            "if (!ok) {",
+            "    createPath([[0, 0]], [], [], false);",
+            "} else {",
+            "    var apex = [(tl[0] + tr[0]) / 2, (tl[1] + tr[1]) / 2];",
+            "    createPath([apex, br, bl], [], [], true);",
+            "}"
+        ]);
+
+        var crossHExpr = corners.concat([
+            "if (!ok) {",
+            "    createPath([[0, 0]], [], [], false);",
+            "} else {",
+            "    var c = [(tl[0] + tr[0] + br[0] + bl[0]) / 4, (tl[1] + tr[1] + br[1] + bl[1]) / 4];",
+            "    var ax = [tr[0] - tl[0], tr[1] - tl[1]];",
+            "    var axLen = length(ax);",
+            "    if (axLen > 0) ax = [ax[0] / axLen, ax[1] / axLen]; else ax = [1, 0];",
+            "    var ch = " + crossH + ";",
+            "    createPath([",
+            "        [c[0] - ax[0] * ch, c[1] - ax[1] * ch],",
+            "        [c[0] + ax[0] * ch, c[1] + ax[1] * ch]",
+            "    ], [], [], false);",
+            "}"
+        ]);
+
+        var crossVExpr = corners.concat([
+            "if (!ok) {",
+            "    createPath([[0, 0]], [], [], false);",
+            "} else {",
+            "    var c = [(tl[0] + tr[0] + br[0] + bl[0]) / 4, (tl[1] + tr[1] + br[1] + bl[1]) / 4];",
+            "    var ay = [bl[0] - tl[0], bl[1] - tl[1]];",
+            "    var ayLen = length(ay);",
+            "    if (ayLen > 0) ay = [ay[0] / ayLen, ay[1] / ayLen]; else ay = [0, 1];",
+            "    var ch = " + crossH + ";",
+            "    createPath([",
+            "        [c[0] - ay[0] * ch, c[1] - ay[1] * ch],",
+            "        [c[0] + ay[0] * ch, c[1] + ay[1] * ch]",
+            "    ], [], [], false);",
+            "}"
+        ]);
+
+        return [
+            rectExpr.join("\n"),
+            triangleExpr.join("\n"),
+            crossHExpr.join("\n"),
+            crossVExpr.join("\n")
+        ];
     }
 
     // ─── Траектория (запечённый path) ────────────────────────────────────────
@@ -432,7 +494,62 @@
         return setup.layer;
     }
 
-    function createOverlayShapeLayer(comp, layerName, label, color) {
+    function addPathsToGroup(groupContents, count) {
+        for (var p = 0; p < count; p++) {
+            groupContents.addProperty("ADBE Vector Shape - Group");
+        }
+    }
+
+    function addStrokeToGroup(groupContents, color, dashed) {
+        var stroke = groupContents.addProperty("ADBE Vector Graphic - Stroke");
+        stroke.property("ADBE Vector Stroke Color").setValue(color);
+        stroke.property("ADBE Vector Stroke Width").setValue(STROKE_WIDTH);
+
+        if (dashed) {
+            var dashes = stroke.property("ADBE Vector Stroke Dashes");
+            dashes.addProperty("ADBE Vector Stroke Dash 1").setValue(DASH_LENGTH);
+            dashes.addProperty("ADBE Vector Stroke Gap 1").setValue(DASH_GAP);
+        }
+
+        var fill = groupContents.addProperty("ADBE Vector Graphic - Fill");
+        fill.property("ADBE Vector Fill Opacity").setValue(0);
+    }
+
+    function createBBoxShapeLayer(comp, layerName, label, color) {
+        var shapeLayer = comp.layers.addShape();
+        shapeLayer.name = layerName;
+        shapeLayer.label = label;
+        shapeLayer.threeDLayer = false;
+
+        var root = shapeLayer.property("ADBE Root Vectors Group");
+
+        var dashedGroup = root.addProperty("ADBE Vector Group");
+        var dashedContents = dashedGroup.property("ADBE Vectors Group");
+        addPathsToGroup(dashedContents, 2);
+        addStrokeToGroup(dashedContents, color, true);
+
+        var solidGroup = root.addProperty("ADBE Vector Group");
+        var solidContents = solidGroup.property("ADBE Vectors Group");
+        addPathsToGroup(solidContents, 2);
+        addStrokeToGroup(solidContents, color, false);
+
+        zeroTransform(shapeLayer);
+
+        var dashedPaths = getFreshPathsInGroup(shapeLayer, 1, 2);
+        var solidPaths = getFreshPathsInGroup(shapeLayer, 2, 2);
+
+        return {
+            layer: shapeLayer,
+            dashedPaths: dashedPaths,
+            solidPaths: solidPaths
+        };
+    }
+
+    function createOverlayShapeLayer(comp, layerName, label, color, pathCount) {
+        if (!pathCount) {
+            pathCount = 1;
+        }
+
         var shapeLayer = comp.layers.addShape();
         shapeLayer.name = layerName;
         shapeLayer.label = label;
@@ -443,35 +560,49 @@
         var group = root.addProperty("ADBE Vector Group");
         var groupContents = group.property("ADBE Vectors Group");
 
-        var pathGroup = groupContents.addProperty("ADBE Vector Shape - Group");
-
-        var stroke = groupContents.addProperty("ADBE Vector Graphic - Stroke");
-        stroke.property("ADBE Vector Stroke Color").setValue(color);
-        stroke.property("ADBE Vector Stroke Width").setValue(STROKE_WIDTH);
-
-        var fill = groupContents.addProperty("ADBE Vector Graphic - Fill");
-        fill.property("ADBE Vector Fill Opacity").setValue(0);
+        addPathsToGroup(groupContents, pathCount);
+        addStrokeToGroup(groupContents, color, true);
 
         zeroTransform(shapeLayer);
 
-        // Извлекаем path свежей навигацией от слоя (кэшированные ссылки могли инвалидироваться)
-        var pathProp = getFreshPath(shapeLayer);
-        if (!pathProp) {
+        // Извлекаем paths свежей навигацией от слоя (кэшированные ссылки могли инвалидироваться)
+        var paths = getFreshPathsInGroup(shapeLayer, 1, pathCount);
+        if (!paths || paths.length === 0) {
             throw new Error("Path property not found");
         }
 
-        return { layer: shapeLayer, path: pathProp };
+        return { layer: shapeLayer, paths: paths, path: paths[0] };
     }
 
-    function getFreshPath(shapeLayer) {
+    function getFreshPathAt(shapeLayer, groupIndex, pathIndex) {
         var root = shapeLayer.property("ADBE Root Vectors Group");
-        var group = root.property(1);
+        var group = root.property(groupIndex);
         var gc = group.property("ADBE Vectors Group");
-        var pathGroup = gc.property("ADBE Vector Shape - Group");
-        if (!pathGroup) {
-            pathGroup = gc.property(1);
+        var found = 0;
+
+        for (var i = 1; i <= gc.numProperties; i++) {
+            var prop = gc.property(i);
+            if (prop.matchName === "ADBE Vector Shape - Group") {
+                if (found === pathIndex) {
+                    return prop.property("ADBE Vector Shape");
+                }
+                found++;
+            }
         }
-        return pathGroup ? pathGroup.property("ADBE Vector Shape") : null;
+
+        return null;
+    }
+
+    function getFreshPathsInGroup(shapeLayer, groupIndex, count) {
+        var paths = [];
+        for (var i = 0; i < count; i++) {
+            var pathProp = getFreshPathAt(shapeLayer, groupIndex, i);
+            if (!pathProp) {
+                throw new Error("Path property not found at group " + groupIndex + ", index " + i);
+            }
+            paths.push(pathProp);
+        }
+        return paths;
     }
 
     function sampleAnchorPointsInComp(layer, comp) {
