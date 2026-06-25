@@ -4,7 +4,7 @@
  *
  * Генерирует для всех видимых слоёв активной композиции:
  *   - живые ориентированные bounding box (shape + expression)
- *   - запечённые траектории движения anchor point (покадровый сэмплинг)
+ *   - запечённые motion path по ключам Position (bezier + маркеры в ключах)
  *
  * Поддерживает: Text, Shape, Footage (image/video), Precomp, Null.
  * Игнорирует: Audio, Camera, Light, Adjustment.
@@ -23,6 +23,8 @@
     var DASH_LENGTH = 6;      // длина штриха пунктира (px)
     var DASH_GAP = 4;         // длина разрыва пунктира (px)
     var CROSS_HALF_SIZE = 10; // половина длины луча креста '+' (px)
+    var HANDLE_HALF_SIZE = 4; // половина стороны handle-квадрата на bbox (px)
+    var TRAJ_KEYFRAME_SQUARE_HALF = 4; // половина стороны квадрата в ключе motion path (px)
     var BOX_PREFIX = "BBox: ";
     var TRAJ_PREFIX = "Traj: ";
     var GROUP_PREFIX = "BBox Group";
@@ -30,7 +32,10 @@
     var GROUP_UNDER_NULL = false;
     var USE_LABEL_COLORS = true;
     var FALLBACK_COLOR = [1, 0.2, 0.2]; // красный, хорошо виден на любом фоне
-    var NULL_BOX_HALF_SIZE = 15; // половина стороны маркера вокруг anchor null-слоя (px)
+    var NULL_DEFAULT_LEFT = -50;
+    var NULL_DEFAULT_TOP = -50;
+    var NULL_DEFAULT_WIDTH = 100;
+    var NULL_DEFAULT_HEIGHT = 100;
 
     // Стандартные цвета меток AE (RGB 0–1), индексы 1–16
     var LABEL_COLORS = [
@@ -119,7 +124,7 @@
                         createdLayers.push(boxLayer);
                     }
 
-                    if (GENERATE_TRAJECTORY && entry.info.trajectoryPoints.length >= 2) {
+                    if (GENERATE_TRAJECTORY && entry.info.motionPath.vertices.length >= 2) {
                         var trajLayer = createTrajectory(comp, entry.info, entry.color, entry.suffix);
                         if (trajLayer) {
                             createdLayers.push(trajLayer);
@@ -317,25 +322,24 @@
 
     // ─── Цвета ───────────────────────────────────────────────────────────────
     function captureSourceLayerInfo(sourceLayer, comp) {
-        var trajPoints = [];
+        var motionPath = { vertices: [], inTangents: [], outTangents: [], keyframePoints: [] };
         if (GENERATE_TRAJECTORY) {
             try {
-                trajPoints = sampleAnchorPointsInComp(sourceLayer, comp);
+                motionPath = collectMotionPathData(sourceLayer);
             } catch (e) {
-                trajPoints = [];
+                motionPath = { vertices: [], inTangents: [], outTangents: [], keyframePoints: [] };
             }
         }
 
         return {
             name: sourceLayer.name,
             label: safeLayerLabel(sourceLayer),
-            isNull: isNullLayer(sourceLayer),
             startTime: sourceLayer.startTime,
             inPoint: sourceLayer.inPoint,
             outPoint: sourceLayer.outPoint,
             stretch: safeLayerStretch(sourceLayer),
             enabled: sourceLayer.enabled,
-            trajectoryPoints: trajPoints
+            motionPath: motionPath
         };
     }
 
@@ -383,35 +387,32 @@
         var layerName = BOX_PREFIX + info.name + uniqueSuffix;
         var setup = createBBoxShapeLayer(comp, layerName, info.label, color);
 
-        var expressions = buildBBoxExpressions(info.name, info.isNull);
+        var expressions = buildBBoxExpressions(info.name);
         setPathExpression(setup.dashedPaths[0], expressions[0]);
         setPathExpression(setup.dashedPaths[1], expressions[1]);
         setPathExpression(setup.solidPaths[0], expressions[2]);
         setPathExpression(setup.solidPaths[1], expressions[3]);
+
+        var handleExpressions = buildHandleExpressions(info.name);
+        for (var hi = 0; hi < handleExpressions.length; hi++) {
+            setPathExpression(setup.handlePaths[hi], handleExpressions[hi]);
+        }
 
         applyLayerTiming(setup.layer, info);
 
         return setup.layer;
     }
 
-    function bboxCornersSnippet(safeName, isNull) {
-        if (isNull) {
-            return [
-                'var L = thisComp.layer("' + safeName + '");',
-                "var ap = L.anchorPoint;",
-                "var h = " + NULL_BOX_HALF_SIZE + ";",
-                "var tl = fromComp(L.toComp([ap[0] - h, ap[1] - h]));",
-                "var tr = fromComp(L.toComp([ap[0] + h, ap[1] - h]));",
-                "var br = fromComp(L.toComp([ap[0] + h, ap[1] + h]));",
-                "var bl = fromComp(L.toComp([ap[0] - h, ap[1] + h]));",
-                "var ok = true;"
-            ];
-        }
-
+    function bboxCornersSnippet(safeName) {
         return [
             'var L = thisComp.layer("' + safeName + '");',
             "var r = L.sourceRectAtTime(time, false);",
             "var ok = r.width > 0 && r.height > 0;",
+            "if (!ok && L.nullLayer) {",
+            "    r = { left: " + NULL_DEFAULT_LEFT + ", top: " + NULL_DEFAULT_TOP +
+                ", width: " + NULL_DEFAULT_WIDTH + ", height: " + NULL_DEFAULT_HEIGHT + " };",
+            "    ok = true;",
+            "}",
             "var tl = ok ? fromComp(L.toComp([r.left, r.top])) : [0, 0];",
             "var tr = ok ? fromComp(L.toComp([r.left + r.width, r.top])) : [0, 0];",
             "var br = ok ? fromComp(L.toComp([r.left + r.width, r.top + r.height])) : [0, 0];",
@@ -419,9 +420,21 @@
         ];
     }
 
-    function buildBBoxExpressions(sourceLayerName, isNull) {
+    function bboxAxesSnippet() {
+        return [
+            "var ax = [tr[0] - tl[0], tr[1] - tl[1]];",
+            "var axLen = length(ax);",
+            "if (axLen > 0) ax = [ax[0] / axLen, ax[1] / axLen]; else ax = [1, 0];",
+            "var ay = [bl[0] - tl[0], bl[1] - tl[1]];",
+            "var ayLen = length(ay);",
+            "if (ayLen > 0) ay = [ay[0] / ayLen, ay[1] / ayLen]; else ay = [0, 1];",
+            "var hs = " + HANDLE_HALF_SIZE + ";"
+        ];
+    }
+
+    function buildBBoxExpressions(sourceLayerName) {
         var safeName = escapeForExpression(sourceLayerName);
-        var corners = bboxCornersSnippet(safeName, isNull);
+        var corners = bboxCornersSnippet(safeName);
         var crossH = CROSS_HALF_SIZE;
 
         var rectExpr = corners.concat([
@@ -481,17 +494,259 @@
         ];
     }
 
-    // ─── Траектория (запечённый path) ────────────────────────────────────────
-    function createTrajectory(comp, info, color, uniqueSuffix) {
-        var layerName = TRAJ_PREFIX + info.name + uniqueSuffix;
-        var setup = createOverlayShapeLayer(comp, layerName, info.label, color);
+    function buildHandleExpressions(sourceLayerName) {
+        var safeName = escapeForExpression(sourceLayerName);
+        var prefix = bboxCornersSnippet(safeName).concat(bboxAxesSnippet());
+        var pointDefs = [
+            "var p = tl;",
+            "var p = tr;",
+            "var p = br;",
+            "var p = bl;",
+            "var p = [(tl[0] + tr[0]) / 2, (tl[1] + tr[1]) / 2];",
+            "var p = [(tr[0] + br[0]) / 2, (tr[1] + br[1]) / 2];",
+            "var p = [(bl[0] + br[0]) / 2, (bl[1] + br[1]) / 2];",
+            "var p = [(tl[0] + bl[0]) / 2, (tl[1] + bl[1]) / 2];"
+        ];
+        var squareBody = [
+            "    createPath([",
+            "        [p[0] - ax[0] * hs - ay[0] * hs, p[1] - ax[1] * hs - ay[1] * hs],",
+            "        [p[0] + ax[0] * hs - ay[0] * hs, p[1] + ax[1] * hs - ay[1] * hs],",
+            "        [p[0] + ax[0] * hs + ay[0] * hs, p[1] + ax[1] * hs + ay[1] * hs],",
+            "        [p[0] - ax[0] * hs + ay[0] * hs, p[1] - ax[1] * hs + ay[1] * hs]",
+            "    ], [], [], true);"
+        ];
+        var result = [];
 
-        var shape = buildOpenPathShape(info.trajectoryPoints);
-        setup.path.setValue(shape);
+        for (var i = 0; i < pointDefs.length; i++) {
+            result.push(prefix.concat([
+                "if (!ok) {",
+                "    createPath([[0, 0]], [], [], false);",
+                "} else {",
+                pointDefs[i]
+            ]).concat(squareBody).concat(["}"]).join("\n"));
+        }
+
+        return result;
+    }
+
+    // ─── Траектория (motion path по ключам Position) ───────────────────────────
+    function createTrajectory(comp, info, color, uniqueSuffix) {
+        var motionPath = info.motionPath;
+        var markerCount = motionPath.keyframePoints.length;
+        var layerName = TRAJ_PREFIX + info.name + uniqueSuffix;
+        var setup = createTrajectoryShapeLayer(comp, layerName, info.label, color, markerCount);
+
+        setup.path.setValue(buildMotionPathShape(motionPath));
+
+        for (var mi = 0; mi < markerCount; mi++) {
+            setup.markerPaths[mi].setValue(
+                buildKeyframeSquareShape(motionPath.keyframePoints[mi], TRAJ_KEYFRAME_SQUARE_HALF)
+            );
+        }
 
         applyLayerTiming(setup.layer, info);
 
         return setup.layer;
+    }
+
+    function getPositionPropertyInfo(layer) {
+        var transform = layer.property("ADBE Transform Group");
+        var pos = transform.property("ADBE Position");
+
+        try {
+            if (pos.dimensionsSeparated) {
+                return {
+                    separated: true,
+                    props: [
+                        transform.property("ADBE Position_0"),
+                        transform.property("ADBE Position_1")
+                    ]
+                };
+            }
+        } catch (e) {}
+
+        return { separated: false, pos: pos };
+    }
+
+    function isSpatialPosition(posInfo) {
+        if (posInfo.separated) {
+            return false;
+        }
+        try {
+            if (posInfo.pos.isSpatial) {
+                return true;
+            }
+            var pvt = posInfo.pos.propertyValueType;
+            return (
+                pvt === PropertyValueType.TwoD_SPATIAL ||
+                pvt === PropertyValueType.ThreeD_SPATIAL
+            );
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function collectPositionKeyframeTimes(layer) {
+        var posInfo = getPositionPropertyInfo(layer);
+        var props = posInfo.separated ? posInfo.props : [posInfo.pos];
+        var timeMap = {};
+        var times = [];
+        var pi;
+        var k;
+
+        for (pi = 0; pi < props.length; pi++) {
+            var prop = props[pi];
+            if (!prop || prop.numKeys === 0) {
+                continue;
+            }
+            for (k = 1; k <= prop.numKeys; k++) {
+                var keyTime = prop.keyTime(k);
+                if (keyTime >= layer.inPoint - 0.0001 && keyTime <= layer.outPoint + 0.0001) {
+                    var key = keyTime.toFixed(6);
+                    if (!timeMap[key]) {
+                        timeMap[key] = keyTime;
+                        times.push(keyTime);
+                    }
+                }
+            }
+        }
+
+        times.sort(function (a, b) {
+            return a - b;
+        });
+
+        return { times: times, posInfo: posInfo };
+    }
+
+    function compTangentFromLayerSpatial(layer, time, keyIndex, posInfo, direction) {
+        var pos = posInfo.pos;
+        var layerPos = pos.keyValue(keyIndex);
+        var px = layerPos[0];
+        var py = layerPos[1];
+        var tangent;
+
+        if (direction === "out") {
+            tangent = pos.keyOutSpatialTangent(keyIndex);
+        } else {
+            tangent = pos.keyInSpatialTangent(keyIndex);
+        }
+
+        var compBase = transformPointToComp(layer, [px, py], time);
+        var compTip = transformPointToComp(layer, [px + tangent[0], py + tangent[1]], time);
+        return [compTip[0] - compBase[0], compTip[1] - compBase[1]];
+    }
+
+    function collectMotionPathData(layer) {
+        var empty = {
+            vertices: [],
+            inTangents: [],
+            outTangents: [],
+            keyframePoints: []
+        };
+        var collected = collectPositionKeyframeTimes(layer);
+        var times = collected.times;
+        var posInfo = collected.posInfo;
+        var spatial = isSpatialPosition(posInfo);
+        var vertices = [];
+        var inTangents = [];
+        var outTangents = [];
+        var keyframePoints = [];
+        var i;
+
+        for (i = 0; i < times.length; i++) {
+            var t = times[i];
+            var vtx = layerAnchorToComp(layer, t);
+            if (!vtx) {
+                continue;
+            }
+
+            vertices.push(vtx);
+            keyframePoints.push(vtx);
+
+            var inTan = [0, 0];
+            var outTan = [0, 0];
+
+            if (spatial) {
+                var keyIndex = posInfo.pos.nearestKeyIndex(t);
+                if (Math.abs(posInfo.pos.keyTime(keyIndex) - t) < 0.0001) {
+                    try {
+                        inTan = compTangentFromLayerSpatial(layer, t, keyIndex, posInfo, "in");
+                        outTan = compTangentFromLayerSpatial(layer, t, keyIndex, posInfo, "out");
+                    } catch (e) {}
+                }
+            }
+
+            inTangents.push(inTan);
+            outTangents.push(outTan);
+        }
+
+        if (vertices.length < 2) {
+            return empty;
+        }
+
+        return {
+            vertices: vertices,
+            inTangents: inTangents,
+            outTangents: outTangents,
+            keyframePoints: keyframePoints
+        };
+    }
+
+    function buildMotionPathShape(motionPath) {
+        var shape = new Shape();
+        shape.vertices = motionPath.vertices;
+        shape.inTangents = motionPath.inTangents;
+        shape.outTangents = motionPath.outTangents;
+        shape.closed = false;
+        return shape;
+    }
+
+    function buildKeyframeSquareShape(center, half) {
+        var x = center[0];
+        var y = center[1];
+        var h = half;
+        var shape = new Shape();
+        shape.vertices = [
+            [x - h, y - h],
+            [x + h, y - h],
+            [x + h, y + h],
+            [x - h, y + h]
+        ];
+        shape.inTangents = [[0, 0], [0, 0], [0, 0], [0, 0]];
+        shape.outTangents = [[0, 0], [0, 0], [0, 0], [0, 0]];
+        shape.closed = true;
+        return shape;
+    }
+
+    function createTrajectoryShapeLayer(comp, layerName, label, color, markerCount) {
+        var shapeLayer = comp.layers.addShape();
+        shapeLayer.name = layerName;
+        shapeLayer.label = label;
+        shapeLayer.threeDLayer = false;
+
+        var root = shapeLayer.property("ADBE Root Vectors Group");
+
+        var pathGroup = root.addProperty("ADBE Vector Group");
+        var pathContents = pathGroup.property("ADBE Vectors Group");
+        addPathsToGroup(pathContents, 1);
+        addStrokeToGroup(pathContents, color, false);
+
+        var markerPaths = [];
+        if (markerCount > 0) {
+            var markerGroup = root.addProperty("ADBE Vector Group");
+            var markerContents = markerGroup.property("ADBE Vectors Group");
+            addPathsToGroup(markerContents, markerCount);
+            addStrokeToGroup(markerContents, color, false);
+            markerPaths = getFreshPathsInGroup(shapeLayer, 2, markerCount);
+        }
+
+        zeroTransform(shapeLayer);
+
+        return {
+            layer: shapeLayer,
+            path: getFreshPathsInGroup(shapeLayer, 1, 1)[0],
+            markerPaths: markerPaths
+        };
     }
 
     function addPathsToGroup(groupContents, count) {
@@ -533,45 +788,23 @@
         addPathsToGroup(solidContents, 2);
         addStrokeToGroup(solidContents, color, false);
 
+        var handlesGroup = root.addProperty("ADBE Vector Group");
+        var handlesContents = handlesGroup.property("ADBE Vectors Group");
+        addPathsToGroup(handlesContents, 8);
+        addStrokeToGroup(handlesContents, color, false);
+
         zeroTransform(shapeLayer);
 
         var dashedPaths = getFreshPathsInGroup(shapeLayer, 1, 2);
         var solidPaths = getFreshPathsInGroup(shapeLayer, 2, 2);
+        var handlePaths = getFreshPathsInGroup(shapeLayer, 3, 8);
 
         return {
             layer: shapeLayer,
             dashedPaths: dashedPaths,
-            solidPaths: solidPaths
+            solidPaths: solidPaths,
+            handlePaths: handlePaths
         };
-    }
-
-    function createOverlayShapeLayer(comp, layerName, label, color, pathCount) {
-        if (!pathCount) {
-            pathCount = 1;
-        }
-
-        var shapeLayer = comp.layers.addShape();
-        shapeLayer.name = layerName;
-        shapeLayer.label = label;
-        shapeLayer.threeDLayer = false;
-
-        var root = shapeLayer.property("ADBE Root Vectors Group");
-
-        var group = root.addProperty("ADBE Vector Group");
-        var groupContents = group.property("ADBE Vectors Group");
-
-        addPathsToGroup(groupContents, pathCount);
-        addStrokeToGroup(groupContents, color, true);
-
-        zeroTransform(shapeLayer);
-
-        // Извлекаем paths свежей навигацией от слоя (кэшированные ссылки могли инвалидироваться)
-        var paths = getFreshPathsInGroup(shapeLayer, 1, pathCount);
-        if (!paths || paths.length === 0) {
-            throw new Error("Path property not found");
-        }
-
-        return { layer: shapeLayer, paths: paths, path: paths[0] };
     }
 
     function getFreshPathAt(shapeLayer, groupIndex, pathIndex) {
@@ -605,28 +838,13 @@
         return paths;
     }
 
-    function sampleAnchorPointsInComp(layer, comp) {
-        var frameStep = comp.frameDuration;
-        var startTime = layer.inPoint;
-        var endTime = layer.outPoint;
-        var points = [];
-        var t = startTime;
-
-        while (t <= endTime + frameStep * 0.001) {
-            var compPoint = layerAnchorToComp(layer, t);
-            if (compPoint) {
-                points.push(compPoint);
-            }
-            t += frameStep;
-        }
-
-        return dedupeConsecutivePoints(points);
-    }
-
     function layerAnchorToComp(layer, time) {
         try {
-            var anchor = layer.property("ADBE Anchor Point").valueAtTime(time, false);
+            var anchor = layer.property("ADBE Transform Group").property("ADBE Anchor Point").valueAtTime(time, false);
             var point = [anchor[0], anchor[1]];
+            if (typeof layer.toComp === "function") {
+                return layer.toComp(point, time);
+            }
             return transformPointToComp(layer, point, time);
         } catch (e) {
             return null;
@@ -663,37 +881,6 @@
         }
 
         return [x, y];
-    }
-
-    function buildOpenPathShape(points) {
-        var shape = new Shape();
-        shape.vertices = points;
-        shape.inTangents = [];
-        shape.outTangents = [];
-        shape.closed = false;
-
-        for (var i = 0; i < points.length; i++) {
-            shape.inTangents.push([0, 0]);
-            shape.outTangents.push([0, 0]);
-        }
-
-        return shape;
-    }
-
-    function dedupeConsecutivePoints(points) {
-        if (points.length <= 1) {
-            return points;
-        }
-
-        var result = [points[0]];
-        for (var i = 1; i < points.length; i++) {
-            var prev = result[result.length - 1];
-            var cur = points[i];
-            if (prev[0] !== cur[0] || prev[1] !== cur[1]) {
-                result.push(cur);
-            }
-        }
-        return result;
     }
 
     // ─── Вспомогательные ─────────────────────────────────────────────────────
