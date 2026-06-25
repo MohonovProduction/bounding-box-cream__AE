@@ -14,14 +14,15 @@
  *   - Для 3D-слоёв toComp даёт 2D-проекцию через активную камеру.
  *   - Траектория запекается один раз; при правке анимации перезапустите скрипт.
  *   - При дублирующихся именах слоёв expression ссылается на верхний слой с таким именем.
- *   - Повторный запуск удаляет ранее созданные слои с префиксами BBox:/Traj:.
+ *   - Bounding boxes и траектории создаются в одной precomp внутри активной композиции.
  */
 
 (function () {
     // ─── Настройки ───────────────────────────────────────────────────────────
-    var STROKE_WIDTH = 3;
-    var DASH_LENGTH = 6;      // длина штриха пунктира (px)
-    var DASH_GAP = 4;         // длина разрыва пунктира (px)
+    var BBOX_STROKE_WIDTH = 1;   // толщина обводки bounding box (px)
+    var TRAJ_STROKE_WIDTH = 1;   // толщина обводки траекторий (px)
+    var BBOX_IN_PRECOMP = true;  // bbox и траектории в одной precomp
+    var BBOX_PRECOMP_PREFIX = "BBox Overlay";
     var CROSS_HALF_SIZE = 10; // половина длины луча креста '+' (px)
     var HANDLE_HALF_SIZE = 4; // половина стороны handle-квадрата на bbox (px)
     var TRAJ_KEYFRAME_SQUARE_HALF = 4; // половина стороны квадрата в ключе motion path (px)
@@ -92,8 +93,20 @@
 
             var parentNull = GROUP_UNDER_NULL ? createGroupNull(comp) : null;
             var createdLayers = [];
+            var bboxLayerCount = 0;
+            var trajLayerCount = 0;
             var skipped = 0;
             var errors = [];
+
+            var overlayTarget = { comp: comp, sourceCompName: null, overlayLayerName: null, precompLayer: null };
+            if (BBOX_IN_PRECOMP) {
+                var bboxSetup = ensureBBoxPrecomp(comp);
+                overlayTarget.comp = bboxSetup.precomp;
+                overlayTarget.sourceCompName = comp.name;
+                overlayTarget.overlayLayerName = bboxPrecompNameFor(comp);
+                overlayTarget.precompLayer = bboxSetup.layer;
+                createdLayers.push(bboxSetup.layer);
+            }
 
             var captured = [];
             var ci;
@@ -119,15 +132,33 @@
             for (ci = 0; ci < captured.length; ci++) {
                 var entry = captured[ci];
                 try {
-                    var boxLayer = createBoundingBox(comp, entry.info, entry.color, entry.suffix);
+                    var boxLayer = createBoundingBox(
+                        overlayTarget.comp,
+                        entry.info,
+                        entry.color,
+                        entry.suffix,
+                        overlayTarget.sourceCompName,
+                        overlayTarget.overlayLayerName
+                    );
                     if (boxLayer) {
-                        createdLayers.push(boxLayer);
+                        bboxLayerCount++;
+                        if (!BBOX_IN_PRECOMP) {
+                            createdLayers.push(boxLayer);
+                        }
                     }
 
                     if (GENERATE_TRAJECTORY && entry.info.motionPath.vertices.length >= 2) {
-                        var trajLayer = createTrajectory(comp, entry.info, entry.color, entry.suffix);
+                        var trajLayer = createTrajectory(
+                            overlayTarget.comp,
+                            entry.info,
+                            entry.color,
+                            entry.suffix
+                        );
                         if (trajLayer) {
-                            createdLayers.push(trajLayer);
+                            trajLayerCount++;
+                            if (!BBOX_IN_PRECOMP) {
+                                createdLayers.push(trajLayer);
+                            }
                         }
                     }
                 } catch (layerErr) {
@@ -149,6 +180,10 @@
                 "Слоёв в композиции: " + stats.total + "\n" +
                 "Подходящих целей: " + targets.length + "\n" +
                 "Создано overlay-слоёв: " + createdLayers.length + "\n" +
+                "  — bounding boxes: " + bboxLayerCount +
+                (BBOX_IN_PRECOMP ? " (в precomp)" : "") + "\n" +
+                "  — траектории: " + trajLayerCount +
+                (BBOX_IN_PRECOMP ? " (в precomp)" : "") + "\n" +
                 "Пропущено: " + skipped + "\n\n" +
                 "Не обработано: " + (stats.total - targets.length) + " слоёв\n" +
                 "  — отключены: " + stats.disabled + "\n" +
@@ -185,11 +220,16 @@
             return (
                 name.indexOf(BOX_PREFIX) === 0 ||
                 name.indexOf(TRAJ_PREFIX) === 0 ||
-                name === GROUP_PREFIX
+                name === GROUP_PREFIX ||
+                name.indexOf(BBOX_PRECOMP_PREFIX) === 0
             );
         } catch (e) {
             return false;
         }
+    }
+
+    function bboxPrecompNameFor(comp) {
+        return BBOX_PRECOMP_PREFIX + ": " + comp.name;
     }
 
     function isNullLayer(layer) {
@@ -293,6 +333,8 @@
     }
 
     function removeGeneratedLayers(comp) {
+        removeBBoxPrecomp(comp);
+
         var namesToRemove = [];
         for (var i = 1; i <= comp.numLayers; i++) {
             var layer = safeGetLayer(comp, i);
@@ -308,6 +350,58 @@
                 } catch (e) {}
             }
         }
+    }
+
+    function removeBBoxPrecomp(comp) {
+        var precompName = bboxPrecompNameFor(comp);
+        var layer = findLayerByName(comp, precompName);
+        if (layer) {
+            try {
+                var source = layer.source;
+                layer.remove();
+                if (source instanceof CompItem && source.name === precompName) {
+                    source.remove();
+                }
+            } catch (e) {}
+        }
+
+        for (var i = app.project.numItems; i >= 1; i--) {
+            var item = app.project.item(i);
+            if (item instanceof CompItem && item.name === precompName && item !== comp) {
+                try {
+                    item.remove();
+                } catch (e) {}
+            }
+        }
+    }
+
+    function ensureBBoxPrecomp(mainComp) {
+        removeBBoxPrecomp(mainComp);
+
+        var precompName = bboxPrecompNameFor(mainComp);
+        var precomp = app.project.items.addComp(
+            precompName,
+            mainComp.width,
+            mainComp.height,
+            mainComp.pixelAspect,
+            mainComp.duration,
+            mainComp.frameRate
+        );
+
+        var layer = mainComp.layers.add(precomp);
+        layer.name = precompName;
+        layer.label = 9;
+        layer.startTime = 0;
+        layer.inPoint = 0;
+        layer.outPoint = mainComp.duration;
+
+        var transform = layer.property("ADBE Transform Group");
+        transform.property("ADBE Anchor Point").setValue([0, 0]);
+        transform.property("ADBE Position").setValue([0, 0]);
+        transform.property("ADBE Scale").setValue([100, 100]);
+        transform.property("ADBE Rotate Z").setValue(0);
+
+        return { precomp: precomp, layer: layer };
     }
 
     function findLayerByName(comp, name) {
@@ -383,17 +477,16 @@
     }
 
     // ─── Bounding Box (живой, expression) ────────────────────────────────────
-    function createBoundingBox(comp, info, color, uniqueSuffix) {
+    function createBoundingBox(comp, info, color, uniqueSuffix, sourceCompName, overlayLayerName) {
         var layerName = BOX_PREFIX + info.name + uniqueSuffix;
         var setup = createBBoxShapeLayer(comp, layerName, info.label, color);
 
-        var expressions = buildBBoxExpressions(info.name);
-        setPathExpression(setup.dashedPaths[0], expressions[0]);
-        setPathExpression(setup.dashedPaths[1], expressions[1]);
-        setPathExpression(setup.solidPaths[0], expressions[2]);
-        setPathExpression(setup.solidPaths[1], expressions[3]);
+        var expressions = buildBBoxExpressions(info.name, sourceCompName, overlayLayerName);
+        for (var oi = 0; oi < expressions.length; oi++) {
+            setPathExpression(setup.outlinePaths[oi], expressions[oi]);
+        }
 
-        var handleExpressions = buildHandleExpressions(info.name);
+        var handleExpressions = buildHandleExpressions(info.name, sourceCompName, overlayLayerName);
         for (var hi = 0; hi < handleExpressions.length; hi++) {
             setPathExpression(setup.handlePaths[hi], handleExpressions[hi]);
         }
@@ -403,9 +496,32 @@
         return setup.layer;
     }
 
-    function bboxCornersSnippet(safeName) {
-        return [
-            'var L = thisComp.layer("' + safeName + '");',
+    function layerRefSnippet(safeName, sourceCompName, overlayLayerName) {
+        if (sourceCompName && overlayLayerName) {
+            var safeComp = escapeForExpression(sourceCompName);
+            var safeOverlay = escapeForExpression(overlayLayerName);
+            return [
+                'var main = comp("' + safeComp + '");',
+                'var overlay = main.layer("' + safeOverlay + '");',
+                'var L = main.layer("' + safeName + '");'
+            ];
+        }
+        return ['var L = thisComp.layer("' + safeName + '");'];
+    }
+
+    function compPointSnippet(pointExpr, sourceCompName, overlayLayerName) {
+        if (sourceCompName && overlayLayerName) {
+            return 'overlay.fromComp(' + pointExpr + ')';
+        }
+        return 'fromComp(' + pointExpr + ')';
+    }
+
+    function bboxCornersSnippet(safeName, sourceCompName, overlayLayerName) {
+        var toLocal = function (pointExpr) {
+            return compPointSnippet(pointExpr, sourceCompName, overlayLayerName);
+        };
+
+        return layerRefSnippet(safeName, sourceCompName, overlayLayerName).concat([
             "var r = L.sourceRectAtTime(time, false);",
             "var ok = r.width > 0 && r.height > 0;",
             "if (!ok && L.nullLayer) {",
@@ -413,11 +529,11 @@
                 ", width: " + NULL_DEFAULT_WIDTH + ", height: " + NULL_DEFAULT_HEIGHT + " };",
             "    ok = true;",
             "}",
-            "var tl = ok ? fromComp(L.toComp([r.left, r.top])) : [0, 0];",
-            "var tr = ok ? fromComp(L.toComp([r.left + r.width, r.top])) : [0, 0];",
-            "var br = ok ? fromComp(L.toComp([r.left + r.width, r.top + r.height])) : [0, 0];",
-            "var bl = ok ? fromComp(L.toComp([r.left, r.top + r.height])) : [0, 0];"
-        ];
+            "var tl = ok ? " + toLocal("L.toComp([r.left, r.top])") + " : [0, 0];",
+            "var tr = ok ? " + toLocal("L.toComp([r.left + r.width, r.top])") + " : [0, 0];",
+            "var br = ok ? " + toLocal("L.toComp([r.left + r.width, r.top + r.height])") + " : [0, 0];",
+            "var bl = ok ? " + toLocal("L.toComp([r.left, r.top + r.height])") + " : [0, 0];"
+        ]);
     }
 
     function bboxAxesSnippet() {
@@ -432,9 +548,9 @@
         ];
     }
 
-    function buildBBoxExpressions(sourceLayerName) {
+    function buildBBoxExpressions(sourceLayerName, sourceCompName, overlayLayerName) {
         var safeName = escapeForExpression(sourceLayerName);
-        var corners = bboxCornersSnippet(safeName);
+        var corners = bboxCornersSnippet(safeName, sourceCompName, overlayLayerName);
         var crossH = CROSS_HALF_SIZE;
 
         var rectExpr = corners.concat([
@@ -494,9 +610,9 @@
         ];
     }
 
-    function buildHandleExpressions(sourceLayerName) {
+    function buildHandleExpressions(sourceLayerName, sourceCompName, overlayLayerName) {
         var safeName = escapeForExpression(sourceLayerName);
-        var prefix = bboxCornersSnippet(safeName).concat(bboxAxesSnippet());
+        var prefix = bboxCornersSnippet(safeName, sourceCompName, overlayLayerName).concat(bboxAxesSnippet());
         var pointDefs = [
             "var p = tl;",
             "var p = tr;",
@@ -729,14 +845,14 @@
         var pathGroup = root.addProperty("ADBE Vector Group");
         var pathContents = pathGroup.property("ADBE Vectors Group");
         addPathsToGroup(pathContents, 1);
-        addStrokeToGroup(pathContents, color, false);
+        addStrokeToGroup(pathContents, color, TRAJ_STROKE_WIDTH);
 
         var markerPaths = [];
         if (markerCount > 0) {
             var markerGroup = root.addProperty("ADBE Vector Group");
             var markerContents = markerGroup.property("ADBE Vectors Group");
             addPathsToGroup(markerContents, markerCount);
-            addStrokeToGroup(markerContents, color, false);
+            addStrokeToGroup(markerContents, color, TRAJ_STROKE_WIDTH);
             markerPaths = getFreshPathsInGroup(shapeLayer, 2, markerCount);
         }
 
@@ -755,16 +871,10 @@
         }
     }
 
-    function addStrokeToGroup(groupContents, color, dashed) {
+    function addStrokeToGroup(groupContents, color, strokeWidth) {
         var stroke = groupContents.addProperty("ADBE Vector Graphic - Stroke");
         stroke.property("ADBE Vector Stroke Color").setValue(color);
-        stroke.property("ADBE Vector Stroke Width").setValue(STROKE_WIDTH);
-
-        if (dashed) {
-            var dashes = stroke.property("ADBE Vector Stroke Dashes");
-            dashes.addProperty("ADBE Vector Stroke Dash 1").setValue(DASH_LENGTH);
-            dashes.addProperty("ADBE Vector Stroke Gap 1").setValue(DASH_GAP);
-        }
+        stroke.property("ADBE Vector Stroke Width").setValue(strokeWidth);
 
         var fill = groupContents.addProperty("ADBE Vector Graphic - Fill");
         fill.property("ADBE Vector Fill Opacity").setValue(0);
@@ -778,32 +888,22 @@
 
         var root = shapeLayer.property("ADBE Root Vectors Group");
 
-        var dashedGroup = root.addProperty("ADBE Vector Group");
-        var dashedContents = dashedGroup.property("ADBE Vectors Group");
-        addPathsToGroup(dashedContents, 2);
-        addStrokeToGroup(dashedContents, color, true);
-
-        var solidGroup = root.addProperty("ADBE Vector Group");
-        var solidContents = solidGroup.property("ADBE Vectors Group");
-        addPathsToGroup(solidContents, 2);
-        addStrokeToGroup(solidContents, color, false);
+        var outlineGroup = root.addProperty("ADBE Vector Group");
+        var outlineContents = outlineGroup.property("ADBE Vectors Group");
+        addPathsToGroup(outlineContents, 4);
+        addStrokeToGroup(outlineContents, color, BBOX_STROKE_WIDTH);
 
         var handlesGroup = root.addProperty("ADBE Vector Group");
         var handlesContents = handlesGroup.property("ADBE Vectors Group");
         addPathsToGroup(handlesContents, 8);
-        addStrokeToGroup(handlesContents, color, false);
+        addStrokeToGroup(handlesContents, color, BBOX_STROKE_WIDTH);
 
         zeroTransform(shapeLayer);
 
-        var dashedPaths = getFreshPathsInGroup(shapeLayer, 1, 2);
-        var solidPaths = getFreshPathsInGroup(shapeLayer, 2, 2);
-        var handlePaths = getFreshPathsInGroup(shapeLayer, 3, 8);
-
         return {
             layer: shapeLayer,
-            dashedPaths: dashedPaths,
-            solidPaths: solidPaths,
-            handlePaths: handlePaths
+            outlinePaths: getFreshPathsInGroup(shapeLayer, 1, 4),
+            handlePaths: getFreshPathsInGroup(shapeLayer, 2, 8)
         };
     }
 
