@@ -88,4 +88,4 @@ Edit the constants at the top of `boundingBoxes.jsx`:
 
 ## License
 
-See [LICENSE](LICENSE) if provided, or contact the repository owner for usage terms.
+This project is licensed under the [MIT License](LICENSE).
